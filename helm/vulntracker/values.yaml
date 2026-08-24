@@ -1,0 +1,108 @@
+replicaCount: 1
+
+image:
+  repository: vulntracker-api
+  tag: latest
+  pullPolicy: IfNotPresent
+
+service:
+  type: ClusterIP
+  port: 80
+  targetPort: 8000
+
+# Public ingress — required for Task 1's share links (GET /share/{token})
+# to be reachable by external stakeholders. Restricted to this one host,
+# no wildcard paths.
+ingress:
+  enabled: true
+  className: nginx
+  host: vulntracker.example.com
+  annotations: {}
+  tls:
+    enabled: true
+    secretName: vulntracker-tls
+
+# Secrets are sourced from a secrets manager via the External Secrets
+# Operator (https://external-secrets.io) — never hardcoded here. This
+# creates a SecretStore-backed ExternalSecret that materializes a native
+# Secret the Deployment reads via envFrom. If your cluster doesn't run ESO,
+# set externalSecret.enabled: false and populate `secretName` by another
+# means (Vault Agent injector, cloud provider's Secrets Store CSI driver,
+# a controlled `kubectl create secret` in a bootstrap step, etc.) — the
+# Deployment only ever reads a Secret name, never a literal value.
+secrets:
+  secretName: vulntracker-secrets
+  externalSecret:
+    enabled: true
+    secretStoreRef:
+      name: vulntracker-secret-store
+      kind: SecretStore
+    refreshInterval: 1h
+    # Maps K8s Secret keys -> remote secrets-manager keys. Adjust
+    # remoteRef.key per your actual secrets backend.
+    data:
+      - secretKey: SECRET_KEY
+        remoteRef:
+          key: vulntracker/secret-key
+      - secretKey: DATABASE_URL
+        remoteRef:
+          key: vulntracker/database-url
+
+# Non-secret configuration (see app/config.py / .env.example for the full list).
+# ALLOWED_HOSTS includes localhost/127.0.0.1 alongside the real public host
+# because kubelet's liveness/readiness probes connect directly to the pod
+# IP — TrustedHostMiddleware would otherwise reject them (see the Host
+# header set on the probes below). Safe to allow: those addresses are only
+# reachable from inside the pod's own network namespace, never from outside.
+env:
+  # Not localhost:3001 (that's the .env.example / local-dev value) — inside
+  # a pod, localhost only reaches that pod itself. This assumes the notify
+  # service is deployed as a Kubernetes Service named "vulntracker-notify"
+  # in the same namespace, resolved via in-cluster DNS.
+  NOTIFY_SERVICE_URL: "http://vulntracker-notify:3001"
+  ALLOWED_HOSTS: "vulntracker.example.com,localhost,127.0.0.1"
+  ACCESS_TOKEN_EXPIRE_MINUTES: "30"
+
+resources:
+  requests:
+    cpu: 100m
+    memory: 128Mi
+  limits:
+    cpu: 500m
+    memory: 256Mi
+
+podSecurityContext:
+  runAsNonRoot: true
+  runAsUser: 999
+  runAsGroup: 999
+  fsGroup: 999
+  seccompProfile:
+    type: RuntimeDefault
+
+containerSecurityContext:
+  allowPrivilegeEscalation: false
+  readOnlyRootFilesystem: true
+  capabilities:
+    drop: ["ALL"]
+
+# SQLite needs a writable path; the root filesystem is read-only (above),
+# so this is an emptyDir mount. NOTE: emptyDir is neither persistent across
+# pod reschedules nor safe to share across multiple replicas — fine for
+# this exercise, but a real deployment should externalize the database
+# (see docs/executive-summary.md).
+persistence:
+  size: 256Mi
+
+networkPolicy:
+  enabled: true
+  ingressNamespaceLabel: ingress-nginx
+  notifyPort: 3001
+  # Label selector matching the notify service's pods, for a precisely
+  # scoped egress rule rather than "any pod in the namespace". Adjust to
+  # match however notify/ is actually deployed alongside this chart.
+  notifySelector:
+    app: vulntracker-notify
+
+serviceAccount:
+  create: true
+  name: ""

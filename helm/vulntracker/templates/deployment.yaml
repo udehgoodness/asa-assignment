@@ -1,0 +1,80 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "vulntracker.fullname" . }}
+  labels:
+    {{- include "vulntracker.labels" . | nindent 4 }}
+spec:
+  replicas: {{ .Values.replicaCount }}
+  selector:
+    matchLabels:
+      {{- include "vulntracker.selectorLabels" . | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "vulntracker.selectorLabels" . | nindent 8 }}
+    spec:
+      serviceAccountName: {{ include "vulntracker.serviceAccountName" . }}
+      automountServiceAccountToken: false
+      securityContext:
+        {{- toYaml .Values.podSecurityContext | nindent 8 }}
+      containers:
+        - name: vulntracker-api
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          securityContext:
+            {{- toYaml .Values.containerSecurityContext | nindent 12 }}
+          ports:
+            - name: http
+              containerPort: {{ .Values.service.targetPort }}
+              protocol: TCP
+          envFrom:
+            - secretRef:
+                name: {{ .Values.secrets.secretName }}
+          env:
+            {{- range $key, $value := .Values.env }}
+            - name: {{ $key }}
+              value: {{ $value | quote }}
+            {{- end }}
+          volumeMounts:
+            - name: data
+              mountPath: /data
+            - name: tmp
+              mountPath: /tmp
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: http
+              # kubelet connects directly to the pod IP with no matching
+              # Host header by default — TrustedHostMiddleware (app/main.py)
+              # would reject that as an untrusted host, so pin it to one of
+              # the values allowed via ALLOWED_HOSTS.
+              httpHeaders:
+                - name: Host
+                  value: localhost
+            initialDelaySeconds: 5
+            periodSeconds: 15
+            timeoutSeconds: 3
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: http
+              httpHeaders:
+                - name: Host
+                  value: localhost
+            initialDelaySeconds: 5
+            periodSeconds: 10
+            timeoutSeconds: 3
+          resources:
+            {{- toYaml .Values.resources | nindent 12 }}
+      volumes:
+        # Writable scratch space required because the root filesystem is
+        # read-only (see containerSecurityContext). Not persistent across
+        # reschedules and not safe to share across replicas — see the note
+        # in values.yaml `persistence`.
+        - name: data
+          emptyDir:
+            sizeLimit: {{ .Values.persistence.size }}
+        - name: tmp
+          emptyDir:
+            sizeLimit: 64Mi

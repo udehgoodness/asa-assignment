@@ -1,0 +1,26 @@
+VulnTracker API has been deployed as {{ include "vulntracker.fullname" . }}.
+
+{{- if .Values.ingress.enabled }}
+It should become reachable at:
+  https://{{ .Values.ingress.host }}
+{{- else }}
+Ingress is disabled. Reach it in-cluster at:
+  http://{{ include "vulntracker.fullname" . }}.{{ .Release.Namespace }}.svc.cluster.local:{{ .Values.service.port }}
+{{- end }}
+
+Before this is usable:
+{{- if .Values.secrets.externalSecret.enabled }}
+  1. Make sure the SecretStore "{{ .Values.secrets.externalSecret.secretStoreRef.name }}" exists in
+     this namespace and the External Secrets Operator is installed — the
+     ExternalSecret this chart creates depends on it to populate the
+     "{{ .Values.secrets.secretName }}" Secret with SECRET_KEY / DATABASE_URL.
+{{- else }}
+  1. externalSecret is disabled — make sure the "{{ .Values.secrets.secretName }}" Secret
+     exists in this namespace by some other means before pods start.
+{{- end }}
+  2. Confirm the notify service is reachable at {{ .Values.env.NOTIFY_SERVICE_URL }}
+     and matches the networkPolicy.notifySelector label used for the egress rule.
+
+Note: SQLite runs on an emptyDir volume (see values.yaml `persistence`) —
+not persistent across pod reschedules, not safe across multiple replicas.
+Fine for this exercise; externalize the database for a real deployment.

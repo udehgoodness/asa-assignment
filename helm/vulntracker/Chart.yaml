@@ -1,0 +1,6 @@
+apiVersion: v2
+name: vulntracker
+description: VulnTracker Python API — Kubernetes deployment chart
+type: application
+version: 0.1.0
+appVersion: "1.0.0"

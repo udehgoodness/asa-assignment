@@ -79,6 +79,34 @@ npm test
 
 ---
 
+## Docker (Python API)
+
+Build and run from the **repo root** (the Dockerfile needs both `requirements.txt` and `app/` in its build context):
+
+```bash
+docker build -t vulntracker-api .
+docker run -d --name vulntracker-api -p 8000:8000 vulntracker-api
+```
+
+Available at `http://localhost:8000`. No environment variables are required to run it — `SECRET_KEY` falls back to a random ephemeral value if unset (a warning is logged); set real values for anything beyond local testing:
+
+```bash
+docker run -d --name vulntracker-api -p 8000:8000 \
+  -e SECRET_KEY="$(openssl rand -hex 32)" \
+  -v vulntracker-data:/data \
+  vulntracker-api
+```
+
+The `-v vulntracker-data:/data` volume persists the SQLite database across container restarts (see `.env.example` for all supported variables). The image runs as a non-root user, ships a `HEALTHCHECK` against `/health`, and is built from a digest-pinned `python:3.11.10-slim-bookworm` base with no secrets embedded — see `Dockerfile`.
+
+---
+
+## Kubernetes (Helm)
+
+`helm/vulntracker/` deploys the API to a Kubernetes cluster — secrets sourced from a secrets manager (via the External Secrets Operator), ingress restricted to what's required, a `NetworkPolicy` limiting both inbound and outbound traffic, resource limits, and a non-root/read-only-root-filesystem security context. See `helm/vulntracker/README.md` for prerequisites and install instructions — it was verified with a real `helm install` against a local cluster during development, not just `helm template`.
+
+---
+
 ## Shared Report Link
 
 Implements the "share a scan with an external stakeholder via a link" feature (Task 1). See [`docs/shared-report-link.md`](docs/shared-report-link.md) for the endpoint reference and security design decisions.

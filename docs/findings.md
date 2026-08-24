@@ -13,7 +13,7 @@
 | VT-01 | JWT decode accepts `alg: none` | Manual | **Critical** | Starter | Open |
 | VT-02 | SQL injection in scan search | SAST (bandit) + Manual | **Critical** | Starter | Open |
 | VT-03 | Hardcoded secrets in source | SAST (bandit, partial) + Manual | High | Starter | Open |
-| VT-04 | IDOR on `GET /scans/{id}` | Manual | High | Starter | Open |
+| VT-04 | IDOR / missing owner scoping on `GET /scans/{id}` and `GET /scans/search` | Manual | High | Starter | Open |
 | VT-05 | Plaintext password logging on login | Manual | High | Starter | Open |
 | VT-06 | Vulnerable dependencies (cryptography, python-jose, starlette, fastapi) | SCA (pip-audit) | High | Starter | Open |
 | VT-07 | Unauthenticated `/notify` + webhook SSRF leaking internal service key | Manual | High | Starter | Open |
@@ -23,6 +23,7 @@
 | VT-11 | `ecdsa` Minerva timing side-channel (no fix available) | SCA (pip-audit) | Medium | Starter | Open |
 | VT-12 | `python-multipart` CVEs (DoS / path traversal in unused code paths) | SCA (pip-audit) | Low | Starter | Open |
 | VT-13 | Share-link password passed as a GET query parameter | Manual (identified during Task 1 design) | Low | Task 1 | Open (compensating controls documented) |
+| VT-14 | Unvalidated password length causes uncaught exception (500 + stack trace) | Manual (found while designing the VT-02 fix) | Medium | Starter + Task 1 | Open |
 
 `bandit` also flagged the literal string `"bearer"` in `main.py` (OAuth2 token type) as a possible hardcoded password — a false positive, not listed above.
 
@@ -50,10 +51,10 @@
 **Severity: High.** `SECRET_KEY` signs every JWT issued by the app — anyone with read access to the repository (contractors, CI logs, a future public fork, a leaked laptop) can forge valid tokens for any user, indefinitely, without ever touching the running system. `DB_USER`/`DB_PASSWORD`/`ADMIN_API_KEY` are, on inspection, **unused dead code** — SQLite needs no credentials and nothing in the codebase reads `ADMIN_API_KEY` — but a hardcoded value with a realistic "prod" naming convention (`sk-vt-prod-...`) is exactly the kind of thing a future engineer assumes is live and load-bearing, and copies into a script or a Slack message without a second thought.
 **Business impact**: silent, permanent authentication bypass (via the JWT key) that requires no interaction with the live service to exploit, plus a standing risk that the unused-but-realistic-looking keys get mistaken for real credentials and propagated elsewhere.
 
-### VT-04 — IDOR on `GET /scans/{id}`
-**Type**: Manual — `app/main.py`. `list_scans`, `update_scan`, and `delete_scan` all filter by `owner_id == current_user.id`; `get_scan` does not.
-**Severity: High.** Any authenticated user — including a brand-new self-registered account — can read any other user's scan by guessing/incrementing a numeric ID.
-**Business impact**: direct cross-tenant leak of exactly the data this product is built to protect: which systems are vulnerable, to what, and whether they've been fixed yet.
+### VT-04 — IDOR / missing owner scoping on `GET /scans/{id}` and `GET /scans/search`
+**Type**: Manual — `app/main.py`, `app/database.py`. `list_scans`, `update_scan`, and `delete_scan` all filter by `owner_id == current_user.id`; `get_scan` does not. The same gap exists in `search_scans_by_query` (`app/database.py`) — its SQL has no `owner_id` clause at all, and `main.py`'s `/scans/search` endpoint never passes `current_user` into it, so a search returns matches across *every* user's scans, not just the caller's. Found while designing the fix for VT-02 (the search endpoint's SQL injection) — parameterizing that query surfaced that it was never scoped to begin with.
+**Severity: High.** Any authenticated user — including a brand-new self-registered account — can read any other user's scan directly by ID, or indirectly by searching for it.
+**Business impact**: direct cross-tenant leak of exactly the data this product is built to protect: which systems are vulnerable, to what, and whether they've been fixed yet. The search endpoint is arguably the easier path to exploit — an attacker doesn't even need to know or guess a valid scan ID, just a common enough search term (e.g. `q=CVE`) to sweep other tenants' findings.
 
 ### VT-05 — Plaintext password logging on login
 **Type**: Manual — `app/main.py`, both the login-attempt log line and the failed-login log line include `payload.password` verbatim.
@@ -78,6 +79,7 @@
 - **VT-09 — Stack traces returned to clients** (Manual, `app/main.py`, global exception handler): unhandled exceptions return `traceback.format_exc()` and the raw exception message in the JSON body. Aids attacker reconnaissance (file paths, library versions, query fragments) and risks leaking sensitive values that end up inside exception messages.
 - **VT-10 — No rate limiting on `/auth/login`** (Manual): unlimited login attempts, no lockout, no delay. Enables credential stuffing / brute force against user accounts. Notably, the Task 1 share-link endpoint *does* implement exactly this kind of protection (5 attempts → 15-minute lockout) — the new feature meets a bar the existing auth flow doesn't.
 - **VT-11 — `ecdsa==0.19.2` Minerva timing side-channel** (SCA (pip-audit), CVE-2024-23342, no fix version published): leaks signing-key nonces via timing during `sign_digest()`. Lower real-world urgency here than the CVE alone suggests — this app's JWTs use `HS256` (symmetric), so the vulnerable ECDSA signing path is a transitive dependency of `python-jose` that isn't actually exercised by current app logic. Still worth tracking since it can't be "upgraded away."
+- **VT-14 — Unvalidated password length causes an uncaught exception** (Manual, found while designing the VT-02 fix, `app/main.py`: `UserRegister.password`, `UserLogin.password`, `ShareCreate.password`): none of these fields cap input length. Tested directly against `get_password_hash()` with a 100,000-character password — it doesn't hash-then-truncate (no CPU-cost DoS), it raises `passlib.exc.PasswordSizeError` immediately, uncaught, which propagates to the global exception handler (VT-09) and returns a 500 with a full stack trace to an unauthenticated caller (`POST /auth/register`) or an authenticated one (`POST /scans/{id}/share`). Low effort, clean fix — a `max_length` constraint on the Pydantic field rejects it with a normal 422 before it ever reaches bcrypt.
 
 ## Low
 

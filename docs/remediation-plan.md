@@ -1,6 +1,6 @@
 # Remediation Plan — Deferred Findings
 
-Covers every finding in `docs/findings.md` **not** fixed in code as part of Task 3 (VT-06 through VT-12). For each: residual risk, effort to remediate, and compensating controls that exist today.
+Covers every finding in `docs/findings.md` **not** fixed in code (VT-06 through VT-12, plus VT-15 from the container scan). For each: residual risk, effort to remediate, and compensating controls that exist today.
 
 ---
 
@@ -38,3 +38,8 @@ Covers every finding in `docs/findings.md` **not** fixed in code as part of Task
 **Residual risk**: DoS via malformed multipart parsing, plus a path-traversal bug gated behind a non-default config (`UPLOAD_DIR`/`UPLOAD_KEEP_FILENAME=True`) this app doesn't set.
 **Effort**: a version bump is trivial in isolation but tied to the same `fastapi`/`starlette` compatibility-testing pass as VT-06.
 **Compensating controls**: the app has zero file-upload endpoints — `python-multipart` is present only as a FastAPI form-handling dependency, so the vulnerable parsing paths are never invoked by any request, legitimate or attacker-supplied, today.
+
+## VT-15 — Base image OS packages carry known CVEs
+**Residual risk**: 9 Critical and 66 High severity CVEs in Debian 12 packages pulled in by `python:3.11.10-slim-bookworm` (`reports/container.trivy.json`). Unlike an application dependency, these aren't something this project's code introduced — they're the OS patch backlog of an official, actively-maintained base image as of the pinned digest.
+**Effort**: not a one-time fix. The Dockerfile pins the base image by digest for build reproducibility, which is good practice but means it will *never* pick up new OS security patches until someone deliberately re-pins to a newer digest. Real remediation is a recurring process: a scheduled job (weekly, say) that checks for a newer `python:3.11-slim-bookworm` digest, rebuilds, re-scans, and re-pins — effort is in setting up that automation once (a few hours), not in this PR.
+**Compensating controls**: the container runs as a non-root user with all Linux capabilities dropped, `allowPrivilegeEscalation: false`, and (in the Helm deployment) a read-only root filesystem — none of these vulnerable OS packages are reachable through the app's own network-facing interface, since nothing in the app shells out to them. Realistic exploitation would require an attacker who already has a foothold via some other vulnerability looking to escalate or escape the container, not a standalone remote path. Recommend setting up the automated base-image-refresh job as a near-term follow-up rather than deferring indefinitely, since this category of risk only grows over time without one.

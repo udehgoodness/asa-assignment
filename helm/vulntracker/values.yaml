@@ -2,7 +2,11 @@ replicaCount: 1
 
 image:
   repository: vulntracker-api
-  tag: latest
+  # Not "latest" — a mutable tag isn't reproducible and can silently change
+  # what's running underneath you (trivy config flagged this: KSV-0013).
+  # Defaults to the chart's declared appVersion; a real CI/CD pipeline
+  # should override this with the specific tag/digest it just built.
+  tag: "1.0.0"
   pullPolicy: IfNotPresent
 
 service:

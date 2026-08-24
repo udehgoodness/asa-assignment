@@ -10,32 +10,26 @@
 
 | ID | Finding | Type | Severity | Code | Status |
 |----|---------|------|----------|------|--------|
-| VT-01 | JWT decode accepts `alg: none` | Manual | **Critical** | Starter | Open |
-| VT-02 | SQL injection in scan search | SAST (bandit) + Manual | **Critical** | Starter | Open |
-| VT-03 | Hardcoded secrets in source | SAST (bandit, partial) + Manual | High | Starter | Open |
-| VT-04 | IDOR / missing owner scoping on `GET /scans/{id}` and `GET /scans/search` | Manual | High | Starter | Open |
-| VT-05 | Plaintext password logging on login | Manual | High | Starter | Open |
-| VT-06 | Vulnerable dependencies (cryptography, python-jose, starlette, fastapi) | SCA (pip-audit) | High | Starter | Open |
-| VT-07 | Unauthenticated `/notify` + webhook SSRF leaking internal service key | Manual | High | Starter | Open |
-| VT-08 | Permissive CORS (reflects any `Origin`, credentials allowed) | Manual | Medium | Starter | Open |
-| VT-09 | Stack traces returned to API clients | Manual | Medium | Starter | Open |
-| VT-10 | No rate limiting on `/auth/login` | Manual | Medium | Starter | Open |
-| VT-11 | `ecdsa` Minerva timing side-channel (no fix available) | SCA (pip-audit) | Medium | Starter | Open |
-| VT-12 | `python-multipart` CVEs (DoS / path traversal in unused code paths) | SCA (pip-audit) | Low | Starter | Open |
-| VT-13 | Share-link password passed as a GET query parameter | Manual (identified during Task 1 design) | Low | Task 1 | Open (compensating controls documented) |
-| VT-14 | Unvalidated password length causes uncaught exception (500 + stack trace) | Manual (found while designing the VT-02 fix) | Medium | Starter + Task 1 | Open |
+| VT-01 | JWT algorithm allowlist includes `alg: none` | Manual | High (revised, see write-up) | Starter | Fixed |
+| VT-02 | SQL injection in scan search | SAST (bandit) + Manual | **Critical** | Starter | Fixed |
+| VT-03 | Hardcoded secrets in source | SAST (bandit, partial) + Manual | High | Starter | Fixed |
+| VT-04 | IDOR / missing owner scoping on `GET /scans/{id}` and `GET /scans/search` | Manual | High | Starter | Fixed |
+| VT-05 | Plaintext password logging on login | Manual | High | Starter | Fixed |
+| VT-06 | Vulnerable dependencies (cryptography, python-jose, starlette, fastapi) | SCA (pip-audit) | High | Starter | Deferred — see remediation-plan.md |
+| VT-07 | Unauthenticated `/notify` + webhook SSRF leaking internal service key | Manual | High | Starter | Deferred — see remediation-plan.md |
+| VT-08 | Permissive CORS (reflects any `Origin`, credentials allowed) | Manual | Medium | Starter | Deferred — see remediation-plan.md |
+| VT-09 | Stack traces returned to API clients | Manual | Medium | Starter | Deferred — see remediation-plan.md |
+| VT-10 | No rate limiting on `/auth/login` | Manual | Medium | Starter | Deferred — see remediation-plan.md |
+| VT-11 | `ecdsa` Minerva timing side-channel (no fix available) | SCA (pip-audit) | Medium | Starter | Deferred — see remediation-plan.md |
+| VT-12 | `python-multipart` CVEs (DoS / path traversal in unused code paths) | SCA (pip-audit) | Low | Starter | Deferred — see remediation-plan.md |
+| VT-13 | Share-link password passed as a GET query parameter | Manual (identified during Task 1 design) | Low | Task 1 | Fixed (mitigated) — see write-up |
+| VT-14 | Unvalidated password length causes uncaught exception (500 + stack trace) | Manual (found while designing the VT-02 fix) | Medium | Starter + Task 1 | Fixed |
 
 `bandit` also flagged the literal string `"bearer"` in `main.py` (OAuth2 token type) as a possible hardcoded password — a false positive, not listed above.
 
 ---
 
 ## Critical
-
-### VT-01 — JWT decode accepts `alg: none`
-**Type**: Manual — `app/auth.py:38`, `jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM, "none"])`.
-**Severity: Critical.** `"none"` in the accepted algorithms list means a token with `{"alg": "none"}` and an empty signature is accepted as valid — no key, no signature, no server secret required. Anyone can mint a JWT for `{"sub": "any-username"}` and be authenticated as that user, including other customers' accounts.
-**Business impact**: complete authentication bypass. An attacker doesn't need to steal a password or a signing key — they construct the token by hand. Combined with VT-04 (IDOR), this is a direct path to reading every customer's vulnerability data.
-**Cross-reference**: `pip-audit` independently flagged `python-jose` for **CVE-2024-33663**, an algorithm-confusion vulnerability in the same library (see VT-06) — the library itself has a history of this exact bug class, and the app's own configuration makes it strictly worse by explicitly opting in to `"none"`.
 
 ### VT-02 — SQL injection in scan search
 **Type**: SAST (bandit `B608`, `app/database.py:23`) + Manual confirmation.
@@ -45,6 +39,15 @@
 ---
 
 ## High
+
+### VT-01 — JWT algorithm allowlist includes `alg: none`
+**Type**: Manual — `app/auth.py:38`, `jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM, "none"])`.
+**Severity: High** (revised down from an initial Critical rating — see the correction note below). Including `"none"` in the accepted algorithms is a real, textbook JWT misconfiguration; a forged token with `{"alg": "none"}` and no signature should never reach this far. It's still wrong to have it there.
+**What's actually exploitable today**: verified by hand-building a forged `alg: none` token (`header.payload.` with an empty third segment, base64url-encoded) and running it through `jwt.decode()` exactly as `auth.py` calls it. The pinned `python-jose==3.3.0` has no registered key-construction handler for `"none"` (`jose/jwk.py: get_key()` returns `None` for it), so `jwt.decode()` raises an uncaught `JWKError` before ever reaching a point where the forged token could be treated as valid — regardless of whether `"none"` is in the app's `algorithms` list. It is **not**, in practice, a working full authentication bypass against this exact dependency version.
+**What is real**: (1) an unauthenticated caller can trigger this crash on any protected endpoint by sending a hand-built `alg: none` token — `JWKError` is not a subclass of `JWTError`, so `auth.py`'s `except JWTError` doesn't catch it, and it surfaces as a 500 with a full stack trace (compounding VT-09) instead of a clean 401; (2) the app-level misconfiguration is a latent, one-dependency-bump-away vulnerability — if `python-jose` is upgraded, or the project ever migrates to a JWT library that *does* implement `alg: none` handling (this exact bug class has real CVEs in other libraries, historically including PyJWT), the same code instantly becomes a working, silent authentication bypass with no other changes required.
+**Business impact**: today, a targeted-but-harmless-to-auth crash with an information-disclosure side effect. The latent risk is what justifies keeping this at High rather than Medium — it's exactly the kind of bug that looks inert in every test until a routine dependency upgrade quietly turns it into a full account-takeover primitive.
+**Correction note**: this finding originally claimed a working, unconditional authentication bypass ("no key, no signature required — anyone can mint a JWT"). That was wrong, and was written from reading the code rather than testing the actual forged-token path against the pinned dependency. Corrected after building and running the real exploit attempt during Task 3 verification — see the fix in `app/auth.py` and the regression test `test_jwt_none_algorithm_is_rejected` in `tests/test_api.py`.
+**Cross-reference**: `pip-audit` independently flagged `python-jose` for **CVE-2024-33663**, a related algorithm-confusion vulnerability in the same library (see VT-06).
 
 ### VT-03 — Hardcoded secrets in source
 **Type**: SAST (bandit `B105`, flagged `SECRET_KEY` and `DB_PASSWORD` in `app/config.py`; did not flag `ADMIN_API_KEY`, whose name doesn't match its "password"-like regex) + Manual review (also found `notify/src/config.js: SERVICE_KEY`).
@@ -84,4 +87,4 @@
 ## Low
 
 - **VT-12 — `python-multipart==0.0.6` CVEs** (SCA (pip-audit), 9 entries): mostly DoS via malformed multipart parsing and a path-traversal bug gated behind a non-default `UPLOAD_DIR`/`UPLOAD_KEEP_FILENAME` config. The app has no file-upload endpoints (`python-multipart` is present only as a FastAPI form-handling dependency) — real exposure today is minimal, but it's dead weight worth removing or upgrading rather than justifying indefinitely.
-- **VT-13 — Share-link password as a GET query parameter** (Manual, identified during Task 1 design, `GET /share/{token}`): query strings are more likely to be captured in access logs, browser history, and proxy logs than a POST body would be. This is the interface the assignment specifies (`GET` + `password` query parameter), so it's a deliberate, spec-driven trade-off rather than an oversight — documented here for completeness and expanded in `docs/remediation-plan.md`.
+- **VT-13 — Share-link password as a GET query parameter** (Manual, identified during Task 1 design, `GET /share/{token}`) — **Fixed (mitigated)**: query strings are more likely to be captured in access logs, browser history, and proxy logs than a POST body or header would be. The README's spec requires the `password` query parameter to keep working, so it hasn't been removed — but `GET /share/{token}` now also accepts an optional `X-Share-Password` header, preferred over the query parameter when both are sent. Any caller that cares about this exposure has a safer option; the residual risk is scoped down to "a caller chooses the query parameter despite the alternative existing," not "there is no alternative."

@@ -1,10 +1,12 @@
 # Security Findings — VulnTracker
 
-**Status: v1** — covers SAST, SCA, and manual review. Container image and IaC scan results will be appended to this document once Task 4 (Dockerfile + Helm chart) lands, since those scans require artifacts that don't exist yet.
+**Status: v2** — covers SAST, SCA, container image, IaC, and manual review; complete across all four required scan categories.
 
 **Context that shapes every severity/impact call below**: VulnTracker exists to store and track *other systems'* unpatched vulnerabilities on behalf of its customers. A breach of this app doesn't just leak "some data" — it hands an attacker a prioritized map of exploitable weaknesses in each customer's actual infrastructure, plus (via the notification/webhook layer) live signals about when new weaknesses are found. Findings that expose scan data or allow account takeover are rated with that in mind, not just against generic CIA-triad defaults.
 
-**Tools used**: [`bandit`](https://github.com/PyCQA/bandit) 1.9.4 (SAST, `bandit -r app/`) and [`pip-audit`](https://github.com/pypa/pip-audit) 2.10.1 (SCA, `pip-audit -r requirements.txt`). Raw output: `reports/sast.bandit.json`, `reports/sca.pip-audit.json`.
+**Tools used**: [`bandit`](https://github.com/PyCQA/bandit) 1.9.4 (SAST, `bandit -r app/`), [`pip-audit`](https://github.com/pypa/pip-audit) 2.10.1 (SCA, `pip-audit -r requirements.txt`), and [`trivy`](https://github.com/aquasecurity/trivy) (container: `trivy image vulntracker-api`; IaC: `trivy config helm/vulntracker`). Raw output: `reports/sast.bandit.json`, `reports/sca.pip-audit.json`, `reports/container.trivy.json`, `reports/iac.trivy.json`.
+
+**A note on timing**: `sast.bandit.json` and `sca.pip-audit.json` are a snapshot from *before* the Task 3 fixes (re-running either today shows far less — bandit finds 1 residual low-confidence false positive, `pip-audit` still shows the deliberately-deferred VT-06 findings). They're kept as-is because they're the evidence this document's analysis and the Task 3 fixes were built from; re-generating them post-fix would erase that trail. `container.trivy.json` and `iac.trivy.json` are necessarily post-Task-4, since the image and chart they scan didn't exist before then.
 
 ## Summary
 
@@ -24,8 +26,10 @@
 | VT-12 | `python-multipart` CVEs (DoS / path traversal in unused code paths) | SCA (pip-audit) | Low | Starter | Deferred — see remediation-plan.md |
 | VT-13 | Share-link password passed as a GET query parameter | Manual (identified during Task 1 design) | Low | Task 1 | Fixed (mitigated) — see write-up |
 | VT-14 | Unvalidated password length causes uncaught exception (500 + stack trace) | Manual (found while designing the VT-02 fix) | Medium | Starter + Task 1 | Fixed |
+| VT-15 | Base image OS packages carry known CVEs (9 Critical, 66 High) | Container (trivy) | High | Starter (Dockerfile) | Deferred — see remediation-plan.md |
+| VT-16 | Helm chart defaults to the mutable `image.tag: latest` | IaC (trivy) | Medium | Task 4 | Fixed |
 
-`bandit` also flagged the literal string `"bearer"` in `main.py` (OAuth2 token type) as a possible hardcoded password — a false positive, not listed above.
+`bandit` also flagged the literal string `"bearer"` in `main.py` (OAuth2 token type) as a possible hardcoded password — a false positive, not listed above. Trivy's container scan also found 24 Critical/High findings in installed Python packages (1 Critical, 23 High) — these substantially reconfirm VT-06 from a different tool/database rather than being a new finding, so they're not separately listed. Trivy's IaC scan additionally flagged 3 Low-severity items (`KSV-0020`/`KSV-0021`: container UID/GID ≤ 10000; `KSV-0110`: workloads in the default namespace) — reviewed and judged non-issues: the first two are a soft heuristic (our `999` is a real system-reserved range, not attacker-influenced), and the third is an artifact of scanning a generic chart with no namespace hardcoded (namespace is a deploy-time choice, not something a reusable chart should fix at authoring time).
 
 ---
 
@@ -74,6 +78,12 @@
 **Severity: High.** Two compounding issues: (1) if the "internal network only" assumption about `/notify` is ever wrong — a misconfigured ingress, a container escape, a permissive network policy — anything that can reach it can trigger arbitrary webhook fan-out with no auth; (2) anyone who can call `POST /webhooks` (also unauthenticated) can register **their own** URL and receive a live copy of the internal `SERVICE_KEY` on every dispatch, or point the URL at an internal-only address (cloud metadata endpoint, admin panel) to use the notify service as an SSRF proxy.
 **Business impact**: this directly informed the Task 4 requirement to "restrict network ingress to only what is required" — the app's own design assumes a network boundary that has to actually be enforced at the infrastructure layer, because nothing in the code enforces it.
 
+### VT-15 — Base image OS packages carry known CVEs
+**Type**: Container (`trivy image vulntracker-api`) — `reports/container.trivy.json`.
+**Severity: High.** 9 Critical and 66 High severity CVEs (352 total across all severities) in Debian 12 OS packages pulled in by the `python:3.11.10-slim-bookworm` base image (e.g. `libgnutls30`, `bsdutils`, `gzip`). This is inherited from an official, actively-maintained base image as of the pinned digest — not a misconfiguration on this project's part — and reflects Debian's own patch backlog rather than something introduced by this Dockerfile.
+**Why it's High and not Critical**: the app's own attack surface is the FastAPI process, not a shell or these OS utilities directly — nothing in the code shells out to `gzip`/`bsdutils`/etc. The container's hardening (non-root `appuser`, dropped capabilities, no compiler/build tools in the final image) meaningfully reduces how reachable most of these bugs actually are from the app's network-facing interface; realistic exploitation mostly requires an attacker who already has some other foothold (e.g. arbitrary code execution via a different bug) looking to escalate or escape the container, not a remote unauthenticated path on its own.
+**Business impact**: not immediately exploitable through the app's own interface, but it's the kind of debt that compounds — a future RCE elsewhere in the stack would have more to work with. Full remediation isn't a one-time code change: it means adopting a rebuild-and-repull cadence so the base image picks up Debian's security patches as they ship (the Dockerfile's digest pin, while good for reproducibility, means the image never gets newer OS patches until someone deliberately re-pins it). See `docs/remediation-plan.md`.
+
 ---
 
 ## Medium
@@ -83,6 +93,7 @@
 - **VT-10 — No rate limiting on `/auth/login`** (Manual): unlimited login attempts, no lockout, no delay. Enables credential stuffing / brute force against user accounts. Notably, the Task 1 share-link endpoint *does* implement exactly this kind of protection (5 attempts → 15-minute lockout) — the new feature meets a bar the existing auth flow doesn't.
 - **VT-11 — `ecdsa==0.19.2` Minerva timing side-channel** (SCA (pip-audit), CVE-2024-23342, no fix version published): leaks signing-key nonces via timing during `sign_digest()`. Lower real-world urgency here than the CVE alone suggests — this app's JWTs use `HS256` (symmetric), so the vulnerable ECDSA signing path is a transitive dependency of `python-jose` that isn't actually exercised by current app logic. Still worth tracking since it can't be "upgraded away."
 - **VT-14 — Unvalidated password length causes an uncaught exception** (Manual, found while designing the VT-02 fix, `app/main.py`: `UserRegister.password`, `UserLogin.password`, `ShareCreate.password`): none of these fields cap input length. Tested directly against `get_password_hash()` with a 100,000-character password — it doesn't hash-then-truncate (no CPU-cost DoS), it raises `passlib.exc.PasswordSizeError` immediately, uncaught, which propagates to the global exception handler (VT-09) and returns a 500 with a full stack trace to an unauthenticated caller (`POST /auth/register`) or an authenticated one (`POST /scans/{id}/share`). Low effort, clean fix — a `max_length` constraint on the Pydantic field rejects it with a normal 422 before it ever reaches bcrypt.
+- **VT-16 — Helm chart defaulted to the mutable `image.tag: latest`** (IaC (trivy), `KSV-0013`, `helm/vulntracker/values.yaml`) — **Fixed**: a floating tag isn't reproducible — the same `helm install` can silently pull a different image over time, and it's harder to answer "what's actually running" during an incident. Changed the default to `"1.0.0"` (the chart's declared `appVersion`), with a comment noting a real CI/CD pipeline should override it with the specific tag/digest it just built.
 
 ## Low
 

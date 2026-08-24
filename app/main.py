@@ -6,9 +6,9 @@ from datetime import datetime, timedelta
 from typing import List, Optional
 
 import httpx
-from fastapi import BackgroundTasks, Depends, FastAPI, HTTPException, Request, status
+from fastapi import BackgroundTasks, Depends, FastAPI, Header, HTTPException, Request, status
 from fastapi.responses import JSONResponse
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from sqlalchemy.orm import Session
 from starlette.middleware.trustedhost import TrustedHostMiddleware
 
@@ -67,12 +67,15 @@ async def global_exception_handler(request: Request, exc: Exception):
 class UserRegister(BaseModel):
     username: str
     email: str
-    password: str
+    # max_length=72 matches bcrypt's own input limit — without it, an
+    # oversized password raises an uncaught PasswordSizeError deep in the
+    # hashing call instead of a clean 422 (see docs/findings.md VT-14).
+    password: str = Field(..., max_length=72)
 
 
 class UserLogin(BaseModel):
     username: str
-    password: str
+    password: str = Field(..., max_length=72)
 
 
 class UserOut(BaseModel):
@@ -116,7 +119,7 @@ class ScanOut(BaseModel):
 
 
 class ShareCreate(BaseModel):
-    password: Optional[str] = None
+    password: Optional[str] = Field(default=None, max_length=72)
 
 
 class ShareOut(BaseModel):
@@ -184,14 +187,10 @@ def register(payload: UserRegister, db: Session = Depends(get_db)):
 
 @app.post("/auth/login")
 def login(payload: UserLogin, db: Session = Depends(get_db)):
-    logger.info("Login attempt — username: %s password: %s", payload.username, payload.password)
+    logger.info("Login attempt — username: %s", payload.username)
     user = db.query(models.User).filter(models.User.username == payload.username).first()
     if not user or not verify_password(payload.password, user.hashed_password):
-        logger.warning(
-            "Failed login — username: '%s' password: '%s'",
-            payload.username,
-            payload.password,
-        )
+        logger.warning("Failed login — username: '%s'", payload.username)
         raise HTTPException(status_code=401, detail="Incorrect username or password")
     token = create_access_token({"sub": user.username})
     return {"access_token": token, "token_type": "bearer"}
@@ -247,7 +246,7 @@ def search_scans(
 ):
     if not q or len(q) < 2:
         raise HTTPException(status_code=400, detail="Search query must be at least 2 characters")
-    results = search_scans_by_query(db, q)
+    results = search_scans_by_query(db, q, current_user.id)
     return {"results": results, "count": len(results)}
 
 
@@ -257,7 +256,10 @@ def get_scan(
     db: Session = Depends(get_db),
     current_user: models.User = Depends(get_current_user),
 ):
-    scan = db.query(models.ScanResult).filter(models.ScanResult.id == scan_id).first()
+    scan = db.query(models.ScanResult).filter(
+        models.ScanResult.id == scan_id,
+        models.ScanResult.owner_id == current_user.id,
+    ).first()
     if not scan:
         raise HTTPException(status_code=404, detail="Scan not found")
     return scan
@@ -354,8 +356,16 @@ def create_share_link(
 def get_shared_scan(
     token: str,
     password: Optional[str] = None,
+    x_share_password: Optional[str] = Header(default=None, alias="X-Share-Password"),
     db: Session = Depends(get_db),
 ):
+    # X-Share-Password (header) is preferred over the password query
+    # parameter when both are sent — headers aren't captured in URL-based
+    # logging/history the way a query string is (see docs/findings.md
+    # VT-13). The query parameter keeps working as-is; it's this endpoint's
+    # spec'd interface, not being removed, just no longer the only option.
+    effective_password = x_share_password or password
+
     link = db.query(models.SharedLink).filter(
         models.SharedLink.token_hash == _hash_share_token(token)
     ).first()
@@ -371,7 +381,7 @@ def get_shared_scan(
         raise HTTPException(status_code=404, detail="Share link not found or expired")
 
     if link.password_hash:
-        if not password or not verify_password(password, link.password_hash):
+        if not effective_password or not verify_password(effective_password, link.password_hash):
             link.failed_attempts += 1
             if link.failed_attempts >= MAX_SHARE_PASSWORD_ATTEMPTS:
                 link.locked_until = now + timedelta(minutes=SHARE_LOCKOUT_MINUTES)

@@ -52,6 +52,8 @@ uvicorn main:app --reload
 
 Available at `http://localhost:8000`. Interactive docs at `http://localhost:8000/docs`.
 
+**Configuration**: the app reads its settings from environment variables (see `.env.example`). None are required for local development — `SECRET_KEY` in particular falls back to a random ephemeral value if unset, so `uvicorn main:app --reload` works out of the box. Set real values (via a secrets manager, not a committed file) for anything beyond local dev.
+
 Run the Python test suite from the **repo root**:
 
 ```bash

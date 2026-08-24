@@ -1,5 +1,7 @@
+import hashlib
 import os
 import sys
+from datetime import datetime, timedelta
 
 import pytest
 from fastapi.testclient import TestClient
@@ -8,6 +10,7 @@ from sqlalchemy.orm import sessionmaker
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "app"))
 
+import models as app_models  # noqa: E402
 from database import Base, get_db  # noqa: E402
 from main import app  # noqa: E402
 
@@ -148,3 +151,120 @@ def test_delete_scan():
 
     resp = client.delete(f"/scans/{scan_id}", headers=auth_headers(token))
     assert resp.status_code == 204
+
+
+# ---------------------------------------------------------------------------
+# Shared report link tests
+# ---------------------------------------------------------------------------
+
+def create_scan_for(token, title="Shared finding"):
+    return client.post("/scans", json={
+        "title": title,
+        "severity": "high",
+        "affected_component": "misc",
+    }, headers=auth_headers(token)).json()["id"]
+
+
+def extract_token_from_share_url(share_url):
+    return share_url.rsplit("/share/", 1)[1]
+
+
+def test_create_and_fetch_share_link_no_password():
+    token = register_and_login()
+    scan_id = create_scan_for(token)
+
+    resp = client.post(f"/scans/{scan_id}/share", json={}, headers=auth_headers(token))
+    assert resp.status_code == 201
+    share_url = resp.json()["share_url"]
+    assert "/share/" in share_url
+
+    share_token = extract_token_from_share_url(share_url)
+    fetch_resp = client.get(f"/share/{share_token}")
+    assert fetch_resp.status_code == 200
+    assert fetch_resp.json()["title"] == "Shared finding"
+    assert "owner_id" not in fetch_resp.json()
+
+
+def test_share_link_password_protected():
+    token = register_and_login()
+    scan_id = create_scan_for(token)
+
+    resp = client.post(
+        f"/scans/{scan_id}/share",
+        json={"password": "s3cret!"},
+        headers=auth_headers(token),
+    )
+    share_token = extract_token_from_share_url(resp.json()["share_url"])
+
+    no_pw_resp = client.get(f"/share/{share_token}")
+    assert no_pw_resp.status_code == 401
+
+    wrong_pw_resp = client.get(f"/share/{share_token}", params={"password": "wrong"})
+    assert wrong_pw_resp.status_code == 401
+
+    correct_pw_resp = client.get(f"/share/{share_token}", params={"password": "s3cret!"})
+    assert correct_pw_resp.status_code == 200
+
+
+def test_share_link_locks_after_max_failed_attempts():
+    token = register_and_login()
+    scan_id = create_scan_for(token)
+
+    resp = client.post(
+        f"/scans/{scan_id}/share",
+        json={"password": "correct-horse"},
+        headers=auth_headers(token),
+    )
+    share_token = extract_token_from_share_url(resp.json()["share_url"])
+
+    for _ in range(5):
+        wrong_resp = client.get(f"/share/{share_token}", params={"password": "nope"})
+        assert wrong_resp.status_code == 401
+
+    locked_resp = client.get(f"/share/{share_token}", params={"password": "correct-horse"})
+    assert locked_resp.status_code == 404
+
+
+def test_non_owner_cannot_share_scan():
+    owner_token = register_and_login(username="owner1", email="owner1@example.com")
+    scan_id = create_scan_for(owner_token)
+
+    other_token = register_and_login(username="intruder1", email="intruder1@example.com")
+    resp = client.post(f"/scans/{scan_id}/share", json={}, headers=auth_headers(other_token))
+    assert resp.status_code == 404
+
+
+def test_share_nonexistent_scan_returns_404():
+    token = register_and_login()
+    resp = client.post("/scans/999999/share", json={}, headers=auth_headers(token))
+    assert resp.status_code == 404
+
+
+def test_share_link_requires_auth():
+    resp = client.post("/scans/1/share", json={})
+    assert resp.status_code in (401, 403)
+
+
+def test_expired_share_link_returns_404():
+    token = register_and_login()
+    scan_id = create_scan_for(token)
+
+    resp = client.post(f"/scans/{scan_id}/share", json={}, headers=auth_headers(token))
+    share_token = extract_token_from_share_url(resp.json()["share_url"])
+
+    token_hash = hashlib.sha256(share_token.encode()).hexdigest()
+    db = TestingSessionLocal()
+    link = db.query(app_models.SharedLink).filter(
+        app_models.SharedLink.token_hash == token_hash
+    ).first()
+    link.expires_at = datetime.utcnow() - timedelta(hours=1)
+    db.commit()
+    db.close()
+
+    fetch_resp = client.get(f"/share/{share_token}")
+    assert fetch_resp.status_code == 404
+
+
+def test_unknown_share_token_returns_404():
+    resp = client.get("/share/not-a-real-token")
+    assert resp.status_code == 404

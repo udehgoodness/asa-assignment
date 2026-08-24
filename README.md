@@ -77,6 +77,12 @@ npm test
 
 ---
 
+## Shared Report Link
+
+Implements the "share a scan with an external stakeholder via a link" feature (Task 1). See [`docs/shared-report-link.md`](docs/shared-report-link.md) for the endpoint reference and security design decisions.
+
+---
+
 ## Your Tasks
 
 ### Task 1 — Extend the App _(~1–1.5 hrs)_

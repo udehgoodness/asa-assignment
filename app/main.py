@@ -1,6 +1,8 @@
+import hashlib
 import logging
+import secrets
 import traceback
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import List, Optional
 
 import httpx
@@ -8,10 +10,11 @@ from fastapi import BackgroundTasks, Depends, FastAPI, HTTPException, Request, s
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 from sqlalchemy.orm import Session
+from starlette.middleware.trustedhost import TrustedHostMiddleware
 
 import models
 from auth import create_access_token, get_current_user, get_password_hash, verify_password
-from config import NOTIFY_SERVICE_URL
+from config import ALLOWED_HOSTS, NOTIFY_SERVICE_URL
 from database import engine, get_db, search_scans_by_query
 
 logging.basicConfig(level=logging.INFO)
@@ -24,6 +27,11 @@ app = FastAPI(
     description="Vulnerability tracking and management REST API",
     version="1.0.0",
 )
+
+# Rejects requests with a Host header outside ALLOWED_HOSTS (400) before they
+# reach any route — closes off Host-header spoofing for endpoints that build
+# URLs from the incoming request (see /scans/{id}/share).
+app.add_middleware(TrustedHostMiddleware, allowed_hosts=ALLOWED_HOSTS)
 
 
 @app.middleware("http")
@@ -107,6 +115,31 @@ class ScanOut(BaseModel):
         from_attributes = True
 
 
+class ShareCreate(BaseModel):
+    password: Optional[str] = None
+
+
+class ShareOut(BaseModel):
+    share_url: str
+
+
+class SharedScanOut(BaseModel):
+    # Deliberately excludes owner_id and other internal fields — this schema
+    # is what an external stakeholder (customer/auditor) sees via a public link.
+    id: int
+    title: str
+    description: Optional[str]
+    severity: str
+    status: str
+    cve_id: Optional[str]
+    affected_component: str
+    remediation_notes: Optional[str]
+    created_at: datetime
+
+    class Config:
+        from_attributes = True
+
+
 # ---------------------------------------------------------------------------
 # Internal helpers
 # ---------------------------------------------------------------------------
@@ -120,6 +153,12 @@ def _fire_notify(event: str, payload: dict) -> None:
         )
     except Exception as exc:
         logger.warning("Notification service unreachable: %s", exc)
+
+
+def _hash_share_token(raw_token: str) -> str:
+    # Only the hash is persisted, so a database compromise (e.g. via SQL
+    # injection elsewhere in this app) doesn't hand out usable share links.
+    return hashlib.sha256(raw_token.encode()).hexdigest()
 
 
 # ---------------------------------------------------------------------------
@@ -270,6 +309,79 @@ def delete_scan(
         raise HTTPException(status_code=404, detail="Scan not found")
     db.delete(scan)
     db.commit()
+
+
+# ---------------------------------------------------------------------------
+# Shared report links
+# ---------------------------------------------------------------------------
+
+SHARE_LINK_EXPIRE_HOURS = 24
+MAX_SHARE_PASSWORD_ATTEMPTS = 5
+SHARE_LOCKOUT_MINUTES = 15
+
+
+@app.post("/scans/{scan_id}/share", response_model=ShareOut, status_code=201)
+def create_share_link(
+    scan_id: int,
+    payload: ShareCreate,
+    request: Request,
+    db: Session = Depends(get_db),
+    current_user: models.User = Depends(get_current_user),
+):
+    scan = db.query(models.ScanResult).filter(
+        models.ScanResult.id == scan_id,
+        models.ScanResult.owner_id == current_user.id,
+    ).first()
+    if not scan:
+        raise HTTPException(status_code=404, detail="Scan not found")
+
+    raw_token = secrets.token_urlsafe(32)
+    link = models.SharedLink(
+        token_hash=_hash_share_token(raw_token),
+        scan_id=scan.id,
+        password_hash=get_password_hash(payload.password) if payload.password else None,
+        expires_at=datetime.utcnow() + timedelta(hours=SHARE_LINK_EXPIRE_HOURS),
+        created_by=current_user.id,
+    )
+    db.add(link)
+    db.commit()
+
+    base_url = str(request.base_url).rstrip("/")
+    return ShareOut(share_url=f"{base_url}/share/{raw_token}")
+
+
+@app.get("/share/{token}", response_model=SharedScanOut)
+def get_shared_scan(
+    token: str,
+    password: Optional[str] = None,
+    db: Session = Depends(get_db),
+):
+    link = db.query(models.SharedLink).filter(
+        models.SharedLink.token_hash == _hash_share_token(token)
+    ).first()
+    if not link:
+        raise HTTPException(status_code=404, detail="Share link not found or expired")
+
+    now = datetime.utcnow()
+    if link.locked_until and link.locked_until <= now:
+        link.failed_attempts = 0
+        link.locked_until = None
+
+    if link.expires_at < now or (link.locked_until and link.locked_until > now):
+        raise HTTPException(status_code=404, detail="Share link not found or expired")
+
+    if link.password_hash:
+        if not password or not verify_password(password, link.password_hash):
+            link.failed_attempts += 1
+            if link.failed_attempts >= MAX_SHARE_PASSWORD_ATTEMPTS:
+                link.locked_until = now + timedelta(minutes=SHARE_LOCKOUT_MINUTES)
+            db.commit()
+            raise HTTPException(status_code=401, detail="Password required or incorrect")
+
+    scan = db.query(models.ScanResult).filter(models.ScanResult.id == link.scan_id).first()
+    if not scan:
+        raise HTTPException(status_code=404, detail="Scan not found or expired")
+    return scan
 
 
 # ---------------------------------------------------------------------------
